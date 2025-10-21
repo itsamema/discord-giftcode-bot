@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Discord Giftcode Relay Bot
-- Watches hidden SOURCE channels
+
+- Watches hidden SOURCE channels (and their threads)
 - Detects gift codes via keywords
 - Extracts expiry dates (YYYY/MM/DD)
 - Detects Chief Concierge / VIP12
@@ -12,7 +13,6 @@ Discord Giftcode Relay Bot
 import os
 import re
 import sqlite3
-import asyncio
 from datetime import datetime, date
 from typing import List, Optional, Tuple
 
@@ -153,12 +153,18 @@ def collect_text_from_message(message: discord.Message) -> str:
 
     return "\n".join(parts)
 
+def is_in_source(message: discord.Message) -> bool:
+    """True if the message is in a watched channel OR in a thread under it."""
+    cid = message.channel.id
+    parent_id = getattr(message.channel, "parent_id", None)  # thread parent
+    return (cid in SOURCE_CHANNEL_IDS) or (parent_id in SOURCE_CHANNEL_IDS)
+
 # ---------- Discord Bot ----------
 intents = discord.Intents.default()
 intents.message_content = True  # enable in Developer Portal too
 intents.guilds = True
 intents.guild_messages = True
-bot = commands.Bot(command_prefix="/", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents)  # use !ping, !debughere, !testpost
 
 @bot.event
 async def on_ready():
@@ -189,18 +195,21 @@ async def on_message(message: discord.Message):
     if message.author.id == bot.user.id:
         return
 
-    # Only watch configured source channels
-    if message.channel.id not in SOURCE_CHANNEL_IDS:
+    # Only watch configured source channels (channel OR its parent, e.g., thread)
+    if not is_in_source(message):
         return
 
-    # ✅ Debug: confirm we see messages in the source channel
-    print(f"🔎 Seen message in source {message.channel.id} from {message.author} (bot={message.author.bot})")
+    # Debug: confirm we see messages in source area
+    print(
+        f"🔎 Seen message in source-like channel {message.channel.id} "
+        f"(parent={getattr(message.channel, 'parent_id', None)}) "
+        f"from {message.author} (bot={message.author.bot})"
+    )
 
     raw = collect_text_from_message(message)
     if not raw or not looks_like_gift_announcement(raw):
         return
 
-    # Optional extra debug:
     print(f"🧩 Matched keywords in message: {raw[:120]}{'…' if len(raw) > 120 else ''}")
 
     codes = find_codes(raw)
@@ -222,10 +231,37 @@ async def on_message(message: discord.Message):
         print(f"📤 Reposting code {code} (recurring={recurring}, vip={is_vip or prev_vip})")
         await announce_code(target, code, best_expiry, is_vip or prev_vip, recurring)
 
-
+# ---------- Commands ----------
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
     await ctx.reply("pong")
+
+@bot.command(name="debughere")
+async def debughere(ctx: commands.Context):
+    me = ctx.guild.me if ctx.guild else None
+    perms = ctx.channel.permissions_for(me) if me else None
+    await ctx.reply(
+        "Here:\n"
+        f"- channel.id = `{ctx.channel.id}`\n"
+        f"- parent_id  = `{getattr(ctx.channel, 'parent_id', None)}`\n"
+        f"- can_view={perms.view_channel if perms else None}, "
+        f"read_history={perms.read_message_history if perms else None}, "
+        f"send={perms.send_messages if perms else None}\n"
+        f"- SOURCE_CHANNEL_IDS = {SOURCE_CHANNEL_IDS}\n"
+        f"- TARGET_CHANNEL_ID  = {TARGET_CHANNEL_ID}"
+    )
+
+@bot.command(name="testpost")
+async def testpost(ctx: commands.Context):
+    ch = bot.get_channel(TARGET_CHANNEL_ID)
+    ok = isinstance(ch, discord.TextChannel)
+    await ctx.reply(f"Target channel ok? {ok}. Trying to send…")
+    if ok:
+        try:
+            await ch.send("Test from bot: hello 👋")
+            await ctx.reply("✅ Sent to target.")
+        except Exception as e:
+            await ctx.reply(f"❌ Failed to send: `{e}`")
 
 # ---------- Keep-alive for Render Web Service (bind to $PORT) ----------
 async def _alive_handler(request):
