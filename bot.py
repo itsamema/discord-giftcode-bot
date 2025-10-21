@@ -193,9 +193,15 @@ async def on_message(message: discord.Message):
     if message.channel.id not in SOURCE_CHANNEL_IDS:
         return
 
+    # ✅ Debug: confirm we see messages in the source channel
+    print(f"🔎 Seen message in source {message.channel.id} from {message.author} (bot={message.author.bot})")
+
     raw = collect_text_from_message(message)
     if not raw or not looks_like_gift_announcement(raw):
         return
+
+    # Optional extra debug:
+    print(f"🧩 Matched keywords in message: {raw[:120]}{'…' if len(raw) > 120 else ''}")
 
     codes = find_codes(raw)
     if not codes:
@@ -213,7 +219,9 @@ async def on_message(message: discord.Message):
         is_new, prev_expiry, prev_vip = store.upsert_code(code, now, expiry, is_vip)
         recurring = not is_new
         best_expiry = expiry or prev_expiry
+        print(f"📤 Reposting code {code} (recurring={recurring}, vip={is_vip or prev_vip})")
         await announce_code(target, code, best_expiry, is_vip or prev_vip, recurring)
+
 
 @bot.command(name="ping")
 async def ping(ctx: commands.Context):
