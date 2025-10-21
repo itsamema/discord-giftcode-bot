@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """
 Discord Giftcode Relay Bot
---------------------------
-Dieser Bot:
-
-- beobachtet einen oder mehrere **versteckte Kanäle** (SOURCE_CHANNEL_IDS)
-- sucht nach Nachrichten mit Keywords wie "gift code", "redeem", "Chief Concierge", etc.
-- erkennt Codes + Ablaufdatum + VIP-Hinweis
-- postet dann automatisch eine saubere Nachricht in einen **öffentlichen Kanal**
-- merkt sich Codes, damit wiederkehrende Codes als „Recurring gift code!“ gepostet werden
+- Watches one or more hidden SOURCE channels
+- Detects gift codes via keywords
+- Extracts expiry dates (normalized to YYYY/MM/DD)
+- Detects Chief Concierge / VIP12
+- Reposts a clean message into a public TARGET channel
+- Stores codes in SQLite to mark recurring ones
 """
 
 import asyncio
@@ -23,15 +21,12 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from aiohttp import web
 
-# ---------- Konfiguration ----------
+# ---------- Config ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Die Kanal-IDs und Keywords werden ausschließlich über Environment Variables gesteuert.
-# Beispiel:
-#   SOURCE_CHANNEL_IDS = "1430128900758831158,143012890012345678"
-#   TARGET_CHANNEL_ID = "1429833113315446807"
-
+# Channel IDs ONLY via env vars, not hardcoded:
+# SOURCE_CHANNEL_IDS="111,222"   TARGET_CHANNEL_ID="333"
 SOURCE_CHANNEL_IDS = [
     int(x.strip())
     for x in os.getenv("SOURCE_CHANNEL_IDS", "").split(",")
@@ -54,11 +49,8 @@ KEYWORDS = [
     if k.strip()
 ]
 
+# Code: 6–25 alnum or blocks like ABCD-1234-XYZ
 CODE_REGEX = re.compile(r"\b([A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+|[A-Z0-9]{6,25})\b")
-EXPIRY_LEADS = re.compile(
-    r"(?:expires|expiry|expire|valid\s+until|redeem\s+until|until|valid\s+by|valid\s+thru|through)\s*[:\-]?\s*",
-    re.IGNORECASE,
-)
 VIP_REGEX = re.compile(r"\b(chief\s*concierge|vip\s*1?2?)\b", re.IGNORECASE)
 
 DB_PATH = os.getenv("DB_PATH", "giftcodes.sqlite3")
@@ -72,7 +64,7 @@ CREATE TABLE IF NOT EXISTS giftcodes (
 );
 """
 
-# ---------- Datenbank ----------
+# ---------- Persistence ----------
 class Store:
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path)
@@ -84,9 +76,7 @@ class Store:
         self, code: str, seen_at: datetime, expiry: Optional[date], is_vip: bool
     ) -> Tuple[bool, Optional[date], bool]:
         cur = self.conn.cursor()
-        cur.execute(
-            "SELECT code, expiry, is_vip FROM giftcodes WHERE code = ?", (code,)
-        )
+        cur.execute("SELECT code, expiry, is_vip FROM giftcodes WHERE code = ?", (code,))
         row = cur.fetchone()
         if row is None:
             cur.execute(
@@ -106,10 +96,9 @@ class Store:
             self.conn.commit()
             return False, existing_expiry, bool(prev_vip_int)
 
-
 store = Store(DB_PATH)
 
-# ---------- Hilfsfunktionen ----------
+# ---------- Helpers ----------
 def normalize_code(token: str) -> str:
     return token.upper()
 
@@ -118,20 +107,18 @@ def looks_like_gift_announcement(raw: str) -> bool:
     return any(k in lower for k in KEYWORDS)
 
 def extract_expiry(raw: str) -> Optional[date]:
-    match = re.search(r"\b(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})\b", raw)
-    if match:
+    # YYYY/MM/DD or YYYY-MM-DD
+    m = re.search(r"\b(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})\b", raw)
+    if m:
         try:
-            y, m, d = map(int, match.groups())
-            return date(y, m, d)
-        except:
-            pass
-    match2 = re.search(r"\b(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{4})\b", raw)
-    if match2:
+            y, mm, dd = map(int, m.groups()); return date(y, mm, dd)
+        except: pass
+    # DD.MM.YYYY or DD/MM/YYYY
+    m2 = re.search(r"\b(\d{1,2})[\/\.](\d{1,2})[\/\.](\d{4})\b", raw)
+    if m2:
         try:
-            d, m, y = map(int, match2.groups())
-            return date(y, m, d)
-        except:
-            pass
+            dd, mm, y = map(int, m2.groups()); return date(y, mm, dd)
+        except: pass
     return None
 
 def find_codes(raw: str) -> List[str]:
@@ -141,16 +128,45 @@ def find_codes(raw: str) -> List[str]:
 def format_date_iso(d: Optional[date]) -> str:
     return d.strftime("%Y/%m/%d") if d else "unbekannt"
 
+def collect_text_from_message(message: discord.Message) -> str:
+    """Gather plaintext + embed/attachment text, since forwarders often use embeds."""
+    parts = []
+    if message.content:
+        parts.append(message.content)
+
+    for e in message.embeds:
+        if e.title: parts.append(e.title)
+        if e.description: parts.append(e.description)
+        for f in getattr(e, "fields", []):
+            if f.name: parts.append(f.name)
+            if f.value: parts.append(f.value)
+        if e.footer and getattr(e.footer, "text", None):
+            parts.append(e.footer.text)
+        if e.author and getattr(e.author, "name", None):
+            parts.append(e.author.name)
+
+    for a in message.attachments:
+        if getattr(a, "description", None):
+            parts.append(a.description)
+        if getattr(a, "filename", None):
+            parts.append(a.filename)
+
+    return "\n".join(parts)
+
 # ---------- Discord Bot ----------
 intents = discord.Intents.default()
-intents.message_content = True
+intents.message_content = True  # enable in Developer Portal too
 intents.guilds = True
 intents.guild_messages = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 @bot.event
 async def on_ready():
-    print(f"✅ Eingeloggt als {bot.user} (id={bot.user.id})")
+    print(f"✅ Logged in as {bot.user} (id={bot.user.id})")
+    print(f"SOURCE_CHANNEL_IDS: {SOURCE_CHANNEL_IDS}")
+    print(f"TARGET_CHANNEL_ID:  {TARGET_CHANNEL_ID}")
+    # Presence/status
+    await bot.change_presence(activity=discord.Game(name="scanning for giftcodes 🎁"))
 
 async def announce_code(target_channel: discord.TextChannel, code: str, expiry: Optional[date], is_vip: bool, recurring: bool):
     header = "Recurring gift code!" if recurring else "New gift code!"
@@ -162,13 +178,17 @@ async def announce_code(target_channel: discord.TextChannel, code: str, expiry: 
 @bot.event
 async def on_message(message: discord.Message):
     await bot.process_commands(message)
-    if message.author.bot:
+
+    # Ignore only our own messages; allow forwarded messages from other bots/webhooks
+    if message.author.id == bot.user.id:
         return
+
+    # Only watch configured source channels
     if message.channel.id not in SOURCE_CHANNEL_IDS:
         return
 
-    raw = message.content
-    if not looks_like_gift_announcement(raw):
+    raw = collect_text_from_message(message)
+    if not raw or not looks_like_gift_announcement(raw):
         return
 
     codes = find_codes(raw)
@@ -179,7 +199,7 @@ async def on_message(message: discord.Message):
     is_vip = bool(VIP_REGEX.search(raw))
     target = bot.get_channel(TARGET_CHANNEL_ID)
     if not isinstance(target, discord.TextChannel):
-        print("⚠️ Zielkanal nicht gefunden.")
+        print("⚠️ Target channel not found or not a text channel.")
         return
 
     now = datetime.utcnow()
@@ -193,7 +213,7 @@ async def on_message(message: discord.Message):
 async def ping(ctx: commands.Context):
     await ctx.reply("pong")
 
-# ---------- Keep-Alive Server (Railway/Replit) ----------
+# ---------- Keep-alive for Render Web Service (bind to $PORT) ----------
 async def _alive_handler(request):
     return web.Response(text="I'm alive!")
 
@@ -202,13 +222,13 @@ async def start_keepalive_server():
     app.router.add_get('/', _alive_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", "10000"))  # <-- Render PORT nutzen
+    port = int(os.getenv("PORT", "10000"))  # Render provides PORT
     site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
 if __name__ == "__main__":
     if not TOKEN:
-        raise SystemExit("❌ DISCORD_TOKEN fehlt!")
+        raise SystemExit("❌ DISCORD_TOKEN missing!")
     loop = asyncio.get_event_loop()
     loop.create_task(start_keepalive_server())
     bot.run(TOKEN)
