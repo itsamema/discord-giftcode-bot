@@ -202,7 +202,8 @@ async def start_keepalive_server():
     app.router.add_get('/', _alive_handler)
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, '0.0.0.0', 8080)
+    port = int(os.getenv("PORT", "10000"))  # <-- Render PORT nutzen
+    site = web.TCPSite(runner, '0.0.0.0', port)
     await site.start()
 
 if __name__ == "__main__":
