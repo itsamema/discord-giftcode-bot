@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 Discord Giftcode Relay Bot
-- Watches one or more hidden SOURCE channels
+- Watches hidden SOURCE channels
 - Detects gift codes via keywords
-- Extracts expiry dates (normalized to YYYY/MM/DD)
+- Extracts expiry dates (YYYY/MM/DD)
 - Detects Chief Concierge / VIP12
-- Reposts a clean message into a public TARGET channel
-- Stores codes in SQLite to mark recurring ones
+- Reposts a clean message to TARGET channel
+- Tracks codes in SQLite to mark recurring ones
 """
 
-import asyncio
 import os
 import re
 import sqlite3
+import asyncio
 from datetime import datetime, date
 from typing import List, Optional, Tuple
 
@@ -25,7 +25,7 @@ from aiohttp import web
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Channel IDs ONLY via env vars, not hardcoded:
+# Channel IDs ONLY via env vars (comma-separated for multiple sources)
 # SOURCE_CHANNEL_IDS="111,222"   TARGET_CHANNEL_ID="333"
 SOURCE_CHANNEL_IDS = [
     int(x.strip())
@@ -49,7 +49,7 @@ KEYWORDS = [
     if k.strip()
 ]
 
-# Code: 6–25 alnum or blocks like ABCD-1234-XYZ
+# Code pattern: 6–25 alnum or blocks like ABCD-1234-XYZ
 CODE_REGEX = re.compile(r"\b([A-Z0-9]{4,}(?:-[A-Z0-9]{4,})+|[A-Z0-9]{6,25})\b")
 VIP_REGEX = re.compile(r"\b(chief\s*concierge|vip\s*1?2?)\b", re.IGNORECASE)
 
@@ -129,7 +129,7 @@ def format_date_iso(d: Optional[date]) -> str:
     return d.strftime("%Y/%m/%d") if d else "unbekannt"
 
 def collect_text_from_message(message: discord.Message) -> str:
-    """Gather plaintext + embed/attachment text, since forwarders often use embeds."""
+    """Gather plaintext + embed/attachment text (forwarders often use embeds)."""
     parts = []
     if message.content:
         parts.append(message.content)
@@ -167,6 +167,12 @@ async def on_ready():
     print(f"TARGET_CHANNEL_ID:  {TARGET_CHANNEL_ID}")
     # Presence/status
     await bot.change_presence(activity=discord.Game(name="scanning for giftcodes 🎁"))
+    # Start the tiny HTTP server AFTER loop is running so Render sees an open port
+    try:
+        await start_keepalive_server()
+        print("🌐 Keep-alive server started.")
+    except Exception as e:
+        print(f"⚠️ Keep-alive server failed to start: {e}")
 
 async def announce_code(target_channel: discord.TextChannel, code: str, expiry: Optional[date], is_vip: bool, recurring: bool):
     header = "Recurring gift code!" if recurring else "New gift code!"
@@ -229,6 +235,4 @@ async def start_keepalive_server():
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("❌ DISCORD_TOKEN missing!")
-    loop = asyncio.get_event_loop()
-    loop.create_task(start_keepalive_server())
     bot.run(TOKEN)
